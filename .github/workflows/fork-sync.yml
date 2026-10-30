@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+#
+# Fork maintenance, not part of upstream: pull TheMaxMur/RS-Key's `main` into this
+# fork daily and rebuild the image this fork exists for, so a change upstream never
+# silently leaves the V2 touch build behind.
+#
+# The merge is a plain `git merge` on purpose. `--ff-only` would be the tidy
+# version, but a fork that ever carries its own commit on `main` (this file is
+# one) can never fast-forward again, and a job that fails every night is a job
+# nobody reads. Conflicts still fail the run loudly, which is the case worth
+# waking up for.
+
+name: fork-sync
+
+on:
+  schedule:
+    # 03:17 UTC — off the hour so it does not queue behind everyone else's cron.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream/main
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "fork sync"
+          git config user.email "fork-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/TheMaxMur/RS-Key.git
+          git fetch --no-tags upstream main
+          before=$(git rev-parse HEAD)
+          git merge --no-edit "upstream/main"
+          if [ "$before" = "$(git rev-parse HEAD)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "already at upstream/main"
+          else
+            git push origin HEAD:main
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "fast-forwarded to $(git rev-parse --short HEAD)"
+          fi
+
+  build:
+    needs: sync
+    # Rebuild only when the sync actually moved, plus on a manual run.
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # The image this fork exists for: `firmware-display-v2` sets
+      # DISPLAY_TP_CHIP=cst3530 for the V2 board of the Waveshare
+      # RP2350-Touch-LCD-2.8. Built through the flake rather than with a loose
+      # toolchain so the bytes stay comparable to the published releases.
+      - name: Build firmware-display-v2
+        run: nix build .#firmware-display-v2 -L
+
+      - name: Record what was built
+        run: |
+          {
+            echo "commit: $(git rev-parse HEAD)"
+            echo "upstream: $(git log -1 --format=%s)"
+            echo "sha256: $(sha256sum result/firmware.uf2 | cut -d' ' -f1)"
+          } | tee build-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-display-v2
+          path: |
+            result/firmware.uf2
+            build-info.txt
+          if-no-files-found: error

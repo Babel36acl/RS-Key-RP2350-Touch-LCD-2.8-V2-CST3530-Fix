@@ -2,14 +2,18 @@
 # Copyright (C) 2026 RS-Key contributors
 #
 # Fork maintenance, not part of upstream: pull TheMaxMur/RS-Key's `main` into this
-# fork daily and rebuild the image this fork exists for, so a change upstream never
-# silently leaves the V2 touch build behind.
+# fork daily and keep a flashable image built from it, so a change upstream never
+# silently leaves this fork's board behind.
 #
 # The merge is a plain `git merge` on purpose. `--ff-only` would be the tidy
-# version, but a fork that ever carries its own commit on `main` (this file is
-# one) can never fast-forward again, and a job that fails every night is a job
-# nobody reads. Conflicts still fail the run loudly, which is the case worth
-# waking up for.
+# version, but a fork that carries its own commit on `main` (this file is one) can
+# never fast-forward again, and a job that fails every night is a job nobody reads.
+# Conflicts still fail the run loudly, which is the case worth waking up for.
+#
+# Two builds, because the two answers differ while the CST3530 work is still a
+# pull request: `main` builds whatever display image upstream has (preferring the
+# V2 one the moment it lands), and `cst3530-touch` builds the V2 image for this
+# fork's own board. The second job turns itself off when the branch disappears.
 
 name: fork-sync
 
@@ -52,7 +56,7 @@ jobs:
             echo "fast-forwarded to $(git rev-parse --short HEAD)"
           fi
 
-  build:
+  build-main:
     needs: sync
     # Rebuild only when the sync actually moved, plus on a manual run.
     if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
@@ -68,10 +72,54 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # The image this fork exists for: `firmware-display-v2` sets
-      # DISPLAY_TP_CHIP=cst3530 for the V2 board of the Waveshare
-      # RP2350-Touch-LCD-2.8. Built through the flake rather than with a loose
-      # toolchain so the bytes stay comparable to the published releases.
+      # Prefer the V2 image once it is in main; until upstream merges it, main only
+      # knows the V1 build and asking for the V2 attribute fails the whole run.
+      - name: Build the display image that main has
+        run: |
+          set -euo pipefail
+          target=firmware-display-v2
+          if ! nix eval --raw ".#packages.x86_64-linux.$target.name" >/dev/null 2>&1; then
+            target=firmware-display
+            echo "::notice::main has no firmware-display-v2 yet (the CST3530 work is still a pull request); building firmware-display"
+          fi
+          echo "target=$target" >> "$GITHUB_ENV"
+          nix build ".#$target" -L
+
+      - name: Record what was built
+        run: |
+          {
+            echo "target: $target"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "subject: $(git log -1 --format=%s)"
+            echo "sha256: $(sha256sum result/firmware.uf2 | cut -d' ' -f1)"
+          } | tee build-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-${{ env.target }}
+          path: |
+            result/firmware.uf2
+            build-info.txt
+          if-no-files-found: error
+
+  build-v2-branch:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cst3530-touch
+          fetch-depth: 1
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # The image this fork exists for: DISPLAY_TP_CHIP=cst3530 for the V2 board of
+      # the Waveshare RP2350-Touch-LCD-2.8. Built through the flake rather than a
+      # loose toolchain so the bytes stay comparable to published releases.
       - name: Build firmware-display-v2
         run: nix build .#firmware-display-v2 -L
 
@@ -79,7 +127,7 @@ jobs:
         run: |
           {
             echo "commit: $(git rev-parse HEAD)"
-            echo "upstream: $(git log -1 --format=%s)"
+            echo "subject: $(git log -1 --format=%s)"
             echo "sha256: $(sha256sum result/firmware.uf2 | cut -d' ' -f1)"
           } | tee build-info.txt
 
